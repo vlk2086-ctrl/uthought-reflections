@@ -89,6 +89,15 @@ body { font-family: var(--font-body); font-size: 14px; background: var(--bg); co
 .topbar .wordmark .uth-mark { font-family: var(--font-display); font-size:17px; color:rgba(255,255,255,.95); }
 .topbar .wordmark .uth-mark i { font-style:italic; color:var(--olive); font-weight:600; }
 .topbar .wordmark span.tag { color:rgba(255,255,255,.6); font-size:10.5px; text-transform:uppercase; letter-spacing:.1em; padding-left:10px; border-left:1px solid rgba(255,255,255,.25); }
+.topnav { display:flex; align-items:center; gap:18px; flex-wrap:wrap; }
+.topnav a { color:rgba(255,255,255,.72); font-size:12.5px; font-weight:600; text-decoration:none; white-space:nowrap; cursor:pointer; }
+.topnav a:hover, .topnav a.active { color:#fff; }
+.topnav a.active { border-bottom: 2px solid var(--olive); padding-bottom: 2px; }
+.breadcrumb { font-size:12px; color:var(--text2); margin-bottom:12px; }
+.breadcrumb a { color:var(--sage); text-decoration:underline; cursor:pointer; }
+.breadcrumb .sep { margin:0 6px; opacity:.5; }
+.chip { display:inline-block; padding:5px 12px; border-radius:999px; border:1px solid var(--border2); font-size:12.5px; margin:0 6px 6px 0; cursor:pointer; }
+.chip:hover { background:var(--bg2); }
 
 .wrap { max-width: 820px; margin: 0 auto; padding: 28px; padding-bottom: 60px; }
 .btn { display:inline-flex; align-items:center; gap:6px; padding:8px 15px; border-radius:var(--radius-sm); font-size:13px; font-weight:500; cursor:pointer; border:none; font-family:var(--font-body); transition:opacity .15s, background .15s; }
@@ -147,6 +156,7 @@ textarea.form-input { resize: vertical; min-height:92px; line-height:1.6; }
 
 <div class="topbar">
   <div class="wordmark"><span class="brand-icon"></span><span class="uth-mark"><i>u</i>Thought</span><span class="tag">Student Companion</span></div>
+  <nav class="topnav" id="topnav"></nav>
 </div>
 
 <div class="wrap" id="student-wrap"></div>
@@ -186,6 +196,7 @@ function fmtDate(d){ if(!d) return ''; const dt=new Date(d+'T00:00:00'); return 
 function fmtDateTime(iso){ if(!iso) return ''; const d=new Date(iso); return isNaN(d)?String(iso):d.toLocaleString(undefined,{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'}); }
 function tierChipSmall(tier){ return tier ? `<span class="tier-chip" style="background:${TIER_HEX[tier]};color:${tier==='technical'?'var(--pine)':'#fff'};margin-right:6px;vertical-align:1px">${TIER_LABEL[tier]}</span>` : ''; }
 function todayStr(){ return new Date().toISOString().slice(0,10); }
+function loadingHTML(what){ return '<div class="hint" style="padding:40px 0;text-align:center"><span class="spin"></span> Loading '+what+'…</div>'; }
 
 /* ── Rich-text rendering (turns bullet/numbered content into real lists), inherited from the builder ── */
 function splitInlineList(text){
@@ -315,26 +326,265 @@ function renderRubricStatic(rubric){
 }
 
 /* ══════════════════════════════════════════════════════════════════════
-   STUDENT VIEW — code-gated companion (the entire content of this file)
+   STUDENT ACCOUNTS — lightweight login (email + password), NOT enterprise
+   auth. Same honest framing as the faculty side: there's no backend
+   server behind this app, so this keeps casual visitors out of a
+   student's own list of courses; it does not stop a technically
+   determined person from reading shared storage directly.
+   ══════════════════════════════════════════════════════════════════════ */
+const STU_SESSION_KEY = 'uthought_student_session_v1';
+let STU = { email:'', loggedIn:false };
+let STU_ENTRIES = null; // this account's list of entered assignments (null = not fetched yet this session)
+function restoreStudentSession(){
+  try { const e = localStorage.getItem(STU_SESSION_KEY); if (e) { STU.email = e; STU.loggedIn = true; } } catch(_){}
+}
+async function studentHashPassword(pw){
+  const enc = new TextEncoder().encode(pw);
+  const buf = await crypto.subtle.digest('SHA-256', enc);
+  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+async function studentDoLogin(){
+  const email = (document.getElementById('stu-login-email').value||'').trim().toLowerCase();
+  const pass = document.getElementById('stu-login-pass').value||'';
+  const status = document.getElementById('stu-login-status');
+  if (!email || !pass) { status.textContent = 'Enter both an email and a password.'; return; }
+  status.innerHTML = '<span class="spin"></span> Checking…';
+  try {
+    const hash = await studentHashPassword(pass);
+    const key = 'studentAccount:'+email;
+    const acct = await storageGet(key, null);
+    if (!acct) {
+      await storageSet(key, { email, passHash: hash, createdAt: new Date().toISOString() });
+      STU = { email, loggedIn:true };
+      try { localStorage.setItem(STU_SESSION_KEY, email); } catch(_){}
+      STU_ENTRIES = null; VIEW.mode = 'mycourses';
+      toast('Account created — you\'re logged in.');
+      renderStudentScreen();
+      loadStudentEntries();
+    } else if (acct.passHash === hash) {
+      STU = { email, loggedIn:true };
+      try { localStorage.setItem(STU_SESSION_KEY, email); } catch(_){}
+      STU_ENTRIES = null; VIEW.mode = 'mycourses';
+      renderStudentScreen();
+      loadStudentEntries();
+    } else {
+      status.textContent = 'Incorrect password for that email.';
+    }
+  } catch(e){ status.textContent = 'Something went wrong — try again.'; }
+}
+function studentLogout(){
+  STU = { email:'', loggedIn:false };
+  try { localStorage.removeItem(STU_SESSION_KEY); } catch(_){}
+  STU_ENTRIES = null;
+  SKILLS = null; SKILLS_UI = { open:null };
+  S = { code:'', assignmentId:'', sectionId:'', assignment:null, submission:null };
+  VIEW = { mode:'login', enteringCode:false };
+  renderStudentScreen();
+}
+function updateStudentNav(){
+  const nav = document.getElementById('topnav'); if (!nav) return;
+  if (!STU.loggedIn) { nav.innerHTML = ''; return; }
+  nav.innerHTML = `
+    <a href="#" data-mode="mycourses" onclick="event.preventDefault();VIEW.mode='mycourses';renderStudentScreen();">My courses</a>
+    <a href="#" onclick="event.preventDefault();studentLogout()">Log out (${esc(STU.email)})</a>`;
+  const active = document.querySelector('#topnav a[data-mode="'+VIEW.mode+'"]'); if (active) active.classList.add('active');
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   STUDENT VIEW — router. Logged out: login/create-account screen. Logged
+   in: My courses (all entered assignments grouped by course — also the
+   planned home for the skills dashboard and career goal selector) or an
+   open assignment.
    ══════════════════════════════════════════════════════════════════════ */
 let S = { code:'', assignmentId:'', sectionId:'', assignment:null, submission:null };
+let VIEW = { mode:'login', enteringCode:false };
 function blankSubmission(code){
   return { code, status:'not_started', answers:[], project:{ link:'', description:'' }, submittedAt:null, grade:null };
 }
 function renderStudentScreen(){
+  updateStudentNav();
   const el = document.getElementById('student-wrap');
-  el.innerHTML = S.assignment ? studentAssignmentHTML() : studentGateHTML();
+  if (!STU.loggedIn) { el.innerHTML = studentLoginHTML(); return; }
+  if (VIEW.mode === 'assignment' && S.assignment) { el.innerHTML = studentAssignmentHTML(); return; }
+  el.innerHTML = studentMyCoursesHTML();
 }
-function studentGateHTML(){
+function studentLoginHTML(){
   return `
   <div class="privacy-banner">
-    <b>This is a prototype.</b> Shared storage here has no per-user access controls — your responses are not privately siloed from other users of this app. Please don't include anything you wouldn't want another user of this tool to potentially be able to see.
+    <b>This is a prototype.</b> Shared storage here has no per-user access controls — your responses are not privately siloed from other users of this app. Please don't include anything you wouldn't want another user of this tool to potentially be able to see. This login is a simple lookup, not enterprise security — it keeps casual visitors out, nothing more.
   </div>
   <div class="card" style="max-width:420px;margin:30px auto 0">
-    <div class="card-title">Enter your code</div>
-    <div class="hint" style="margin-bottom:12px">Your instructor gave you a code in the format <b>XX-000</b>, e.g. MJ-4K7.</div>
+    <div class="card-title">Log in / create your account</div>
+    <div class="hint" style="margin-bottom:12px">One account follows you across every course and assignment you enter a code for — no need to re-enter codes on the same device, and your work is right where you left it if you log in on a different one.</div>
+    <div class="form-group"><label class="form-label">Email</label><input class="form-input" id="stu-login-email" placeholder="you@school.edu" onkeydown="if(event.key==='Enter')document.getElementById('stu-login-pass').focus()"></div>
+    <div class="form-group"><label class="form-label">Password</label><input class="form-input" type="password" id="stu-login-pass" placeholder="••••••••" onkeydown="if(event.key==='Enter')studentDoLogin()"></div>
+    <button class="btn btn-primary" style="width:100%" onclick="studentDoLogin()">Log in / create account →</button>
+    <div class="hint" id="stu-login-status" style="margin-top:10px;min-height:16px"></div>
+  </div>`;
+}
+async function loadStudentEntries(){
+  STU_ENTRIES = await storageGet('studentIndex:'+STU.email, []);
+  if (VIEW.mode === 'mycourses') renderStudentScreen();
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   SKILLS DASHBOARD — built entirely from this student's own submitted
+   reflections (no separate "skills" storage of its own). Every reflection
+   prompt already carries the tier + skill it was tagged with by the
+   instructor who wrote it; once a student submits that prompt, it counts
+   as evidence. Pulled fresh across every assignment the student has
+   entered a code for, so it's automatically per-student and per-major —
+   there's no separate declared-major filter because it's just "your work."
+   ══════════════════════════════════════════════════════════════════════ */
+let SKILLS = null; // null = not loaded yet this session; { character:{}, durable:{}, technical:{} } once loaded, each mapping skill name -> array of evidence items
+let SKILLS_UI = { open:null };
+async function loadSkillsEvidence(){
+  const entries = STU_ENTRIES || [];
+  const byTier = { character:{}, durable:{}, technical:{} };
+  await Promise.all(entries.map(async e => {
+    const [sub, asn] = await Promise.all([
+      storageGet('submission:'+e.assignmentId+':'+e.sectionId+':'+e.code, null),
+      storageGet('assignment:'+e.assignmentId, null)
+    ]);
+    if (!sub) return;
+    // Self-reported evidence: every reflection prompt the student has submitted,
+    // tagged with the tier/skill the instructor wrote into the prompt itself.
+    (sub.answers||[]).forEach(a => {
+      if (a.status !== 'submitted' || !a.tier || !a.skill) return;
+      const tier = byTier[a.tier]; if (!tier) return;
+      if (!tier[a.skill]) tier[a.skill] = [];
+      tier[a.skill].push({
+        source: 'reflection', courseName: e.courseName||'', assignmentTitle: e.assignmentTitle||'', code: e.code,
+        trigger: a.trigger||'', submittedAt: a.submittedAt||null
+      });
+    });
+    // Instructor-assessed evidence: once faculty grades a submission against the
+    // rubric, each graded criterion (which also carries a tier + skill) becomes a
+    // stronger, validated form of evidence — distinct from the student's own
+    // self-reported reflections above, per the same evidence you already see in
+    // the rubric during grading.
+    if (sub.grade && Array.isArray(sub.grade.criteria) && asn && asn.rubric && Array.isArray(asn.rubric.criteria)) {
+      const scale = asn.rubric.scale || [];
+      asn.rubric.criteria.forEach((c, ci) => {
+        const g = sub.grade.criteria[ci];
+        if (!g || g.levelIndex == null || !c.tier || !c.skill) return;
+        const tier = byTier[c.tier]; if (!tier) return;
+        if (!tier[c.skill]) tier[c.skill] = [];
+        const levelLabel = (scale[g.levelIndex]||{}).label || '';
+        tier[c.skill].push({
+          source: 'assessment', courseName: e.courseName||'', assignmentTitle: e.assignmentTitle||'', code: e.code,
+          levelLabel, comment: g.comment||'', submittedAt: sub.grade.gradedAt||null
+        });
+      });
+    }
+  }));
+  SKILLS = byTier;
+  if (VIEW.mode === 'mycourses') renderStudentScreen();
+}
+function toggleSkillDetail(key){ SKILLS_UI.open = (SKILLS_UI.open===key ? null : key); renderStudentScreen(); }
+function skillsDashboardCardHTML(){
+  if (SKILLS === null) {
+    loadSkillsEvidence();
+    return `<div class="card"><div class="card-title">Skills dashboard</div>${loadingHTML('your skills evidence')}</div>`;
+  }
+  const tiers = ['character','durable','technical'];
+  const totalCount = tiers.reduce((sum,t)=> sum + Object.values(SKILLS[t]).reduce((s,arr)=>s+arr.length,0), 0);
+  const barsHTML = tiers.map(t=>{
+    const skillMap = SKILLS[t];
+    const skillNames = Object.keys(skillMap).sort();
+    const tierCount = skillNames.reduce((s,n)=>s+skillMap[n].length,0);
+    const pct = totalCount ? Math.round(100*tierCount/totalCount) : 0;
+    const chips = skillNames.map(name => {
+      const items = skillMap[name];
+      const openKey = t+'::'+name;
+      const isOpen = SKILLS_UI.open === openKey;
+      const assessedCount = items.filter(it=>it.source==='assessment').length;
+      const detail = items.map(it=>{
+        const sourceTag = it.source === 'assessment'
+          ? `<span class="status-pill" style="background:var(--teal);margin-left:6px">✓ Instructor-assessed${it.levelLabel?' — '+esc(it.levelLabel):''}</span>`
+          : `<span class="status-pill" style="background:#8A8A80;margin-left:6px">Self-reported</span>`;
+        const dateStr = it.submittedAt ? esc(fmtDate(String(it.submittedAt).slice(0,10))) : '';
+        const comment = it.source==='assessment' && it.comment ? `<div class="hint" style="margin:2px 0 0 0"><i>${esc(it.comment)}</i></div>` : '';
+        return `<div style="margin-bottom:6px">${esc(it.courseName)}${it.assignmentTitle?' · '+esc(it.assignmentTitle):''}${dateStr?' · '+dateStr:''}${sourceTag}
+          <a href="#" onclick="event.preventDefault();openStudentEntry('${esc(it.code)}')" style="color:var(--sage);margin-left:6px">Open →</a>${comment}</div>`;
+      }).join('');
+      return `<div style="margin-bottom:6px">
+        <span class="chip" style="border-color:${TIER_HEX[t]};font-size:12px;padding:4px 10px" onclick="toggleSkillDetail('${esc(openKey)}')">${esc(name)} (${items.length}${assessedCount?', '+assessedCount+' assessed':''})</span>
+        ${isOpen ? `<div style="margin:6px 0 2px 4px">${detail}</div>` : ''}
+      </div>`;
+    }).join('') || '<div class="hint">No evidence yet.</div>';
+    return `<div style="margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px">
+        <b style="color:${TIER_HEX[t]};${t==='technical'?'':''}">${TIER_LABEL[t]}</b>
+        <span class="hint">${tierCount} reflection${tierCount===1?'':'s'}</span>
+      </div>
+      <div style="background:var(--bg2);border-radius:999px;height:8px;overflow:hidden;margin-bottom:8px">
+        <div style="width:${pct}%;height:100%;background:${TIER_HEX[t]}"></div>
+      </div>
+      ${chips}
+    </div>`;
+  }).join('');
+  return `<div class="card">
+    <div class="card-title">Skills dashboard</div>
+    <div class="hint" style="margin-bottom:14px">Built from two sources: your own submitted reflections (self-reported, shown gray), and — once your instructor grades your work against the rubric — instructor-assessed evidence (validated, shown teal) for whichever skills that rubric covered. Click a skill to see where each piece came from.</div>
+    ${totalCount ? barsHTML : '<div class="hint">Submit a reflection, or wait for your instructor to grade your work, to start building this out.</div>'}
+  </div>`;
+}
+async function upsertStudentIndex(entry){
+  const key = 'studentIndex:'+STU.email;
+  const list = await storageGet(key, []);
+  const filtered = list.filter(e=>!(e.assignmentId===entry.assignmentId && e.sectionId===entry.sectionId));
+  filtered.unshift(entry);
+  await storageSet(key, filtered);
+  STU_ENTRIES = filtered;
+}
+function studentMyCoursesHTML(){
+  if (STU_ENTRIES === null) { loadStudentEntries(); return loadingHTML('your courses'); }
+  const groups = {};
+  STU_ENTRIES.forEach(e=>{ const gname = e.courseName || 'Other'; (groups[gname] = groups[gname] || []).push(e); });
+  const courseNames = Object.keys(groups).sort();
+  const groupsHTML = courseNames.map(name => `
+    <div class="card">
+      <div class="card-title">${esc(name)}</div>
+      ${groups[name].map(e => `
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
+          <div>
+            <div style="font-weight:600">${esc(e.assignmentTitle||'Assignment')}</div>
+            <div class="hint">${esc([e.instructor, e.code].filter(Boolean).join(' · '))}</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" onclick="openStudentEntry('${esc(e.code)}')">Open →</button>
+        </div>`).join('')}
+    </div>`).join('');
+  return `
+  <div class="privacy-banner">
+    <b>This is a prototype.</b> Shared storage here has no per-user access controls — please don't include anything you wouldn't want another user of this tool to potentially be able to see.
+  </div>
+  <div class="section-head">My courses</div>
+  <div class="hint" style="margin-bottom:16px">Every assignment you've entered a code for, grouped by course.</div>
+
+  <div class="card">
+    <div class="card-title">Enter an assignment code</div>
+    ${VIEW.enteringCode ? studentCodeFormHTML() : `<button class="btn btn-ghost btn-sm" onclick="VIEW.enteringCode=true;renderStudentScreen();">＋ Enter a new assignment code</button>`}
+  </div>
+
+  ${groupsHTML || '<div class="card"><div class="hint">No assignments yet — enter a code above to get started.</div></div>'}
+
+  ${skillsDashboardCardHTML()}
+
+  <div class="card">
+    <div class="card-title">Career goals</div>
+    <div class="hint">Coming soon — set one or more career goals here and see how the skills you're building connect to the roles you're aiming for.</div>
+  </div>`;
+}
+function studentCodeFormHTML(){
+  return `
+  <div style="max-width:360px">
+    <div class="hint" style="margin-bottom:8px">Your instructor gave you a code in the format <b>XX-000</b>, e.g. MJ-4K7.</div>
     <input class="form-input code-input-lg" id="student-code-in" placeholder="MJ-4K7" maxlength="6" onkeydown="if(event.key==='Enter')studentEnter()">
-    <button class="btn btn-primary" style="width:100%;margin-top:12px" onclick="studentEnter()">Open assignment →</button>
+    <div style="display:flex;gap:8px;margin-top:10px">
+      <button class="btn btn-primary" onclick="studentEnter()">Open assignment →</button>
+      <button class="btn btn-ghost" onclick="VIEW.enteringCode=false;renderStudentScreen();">Cancel</button>
+    </div>
     <div class="hint" id="student-gate-status" style="margin-top:10px;min-height:16px"></div>
   </div>`;
 }
@@ -349,14 +599,35 @@ async function studentEnter(){
     if (!entry || !entry.assignmentId || !entry.sectionId) { status.textContent = 'Code not recognized. Double check with your instructor.'; return; }
     const assignment = await storageGet('assignment:'+entry.assignmentId, null);
     if (!assignment) { status.textContent = 'This assignment couldn’t be found — ask your instructor to re-publish.'; return; }
+    const hdr = assignment.header||{};
+    await upsertStudentIndex({
+      code: raw, assignmentId: entry.assignmentId, sectionId: entry.sectionId,
+      courseId: assignment.courseId||null, courseName: hdr.course||'', assignmentTitle: hdr.title||'',
+      instructor: hdr.instructor||'', addedAt: new Date().toISOString()
+    });
     S.code = raw; S.assignmentId = entry.assignmentId; S.sectionId = entry.sectionId; S.assignment = assignment;
     S.submission = (await storageGet('submission:'+entry.assignmentId+':'+entry.sectionId+':'+raw, null)) || blankSubmission(raw);
+    VIEW.mode = 'assignment'; VIEW.enteringCode = false;
     renderStudentScreen();
   } catch(e){ status.textContent = 'Something went wrong — try again.'; }
 }
+async function openStudentEntry(code){
+  const entry = (STU_ENTRIES||[]).find(e=>e.code===code);
+  if (!entry) { toast('Could not find that assignment.'); return; }
+  const el = document.getElementById('student-wrap');
+  el.innerHTML = loadingHTML('the assignment');
+  try {
+    const assignment = await storageGet('assignment:'+entry.assignmentId, null);
+    if (!assignment) { toast('This assignment couldn’t be found — ask your instructor to re-publish.'); renderStudentScreen(); return; }
+    S.code = entry.code; S.assignmentId = entry.assignmentId; S.sectionId = entry.sectionId; S.assignment = assignment;
+    S.submission = (await storageGet('submission:'+entry.assignmentId+':'+entry.sectionId+':'+entry.code, null)) || blankSubmission(entry.code);
+    VIEW.mode = 'assignment';
+    renderStudentScreen();
+  } catch(e){ toast('Something went wrong.'); renderStudentScreen(); }
+}
 function promptStatus(p, submission){
   const ans = (submission.answers||[]).find(a=>a.id===p.id);
-  if (ans && ans.text && ans.text.trim()) return 'submitted';
+  if (ans && ans.status === 'submitted') return 'submitted';
   if (p.release && p.release > todayStr()) return 'locked';
   return 'open';
 }
@@ -384,7 +655,7 @@ function bindPasteBlock(el){
 let studentSaveT;
 function onAnswerInput(promptId, tier, skill, trigger, val){
   let a = S.submission.answers.find(x=>x.id===promptId);
-  if (!a) { a = { id:promptId, tier, skill, trigger, text:'' }; S.submission.answers.push(a); }
+  if (!a) { a = { id:promptId, tier, skill, trigger, text:'', status:'draft', submittedAt:null }; S.submission.answers.push(a); }
   a.text = val;
   if (S.submission.status === 'not_started') S.submission.status = 'in_progress';
   clearTimeout(studentSaveT);
@@ -392,6 +663,17 @@ function onAnswerInput(promptId, tier, skill, trigger, val){
 }
 async function saveSubmission(){
   await storageSet('submission:'+S.assignmentId+':'+S.sectionId+':'+S.code, S.submission);
+}
+function submitReflection(promptId){
+  const a = S.submission.answers.find(x=>x.id===promptId);
+  if (!a || !a.text || !a.text.trim()) { toast('Write a reflection before submitting.'); return; }
+  if (!confirm('Submit this reflection? Contact your instructor if you need to revise it afterward.')) return;
+  a.status = 'submitted';
+  a.submittedAt = new Date().toISOString();
+  saveSubmission();
+  SKILLS = null; // this reflection is now evidence — recompute the dashboard next time it's viewed
+  renderStudentScreen();
+  toast('Reflection submitted.');
 }
 function onProjectField(k, v){
   S.submission.project[k] = v;
@@ -420,9 +702,13 @@ function studentAssignmentHTML(){
     let body;
     if (st === 'locked') {
       body = `<div class="hint">Opens ${esc(fmtDate(p.release))}.</div>`;
+    } else if (st === 'submitted') {
+      body = `<textarea class="form-input" readonly>${esc(ans?ans.text:'')}</textarea>
+        <div class="note note-teal" style="margin-top:8px">Submitted ${esc(fmtDateTime(ans&&ans.submittedAt))}. Contact your instructor if you need to revise it.</div>`;
     } else {
-      const readonly = sub.status === 'submitted' ? 'readonly' : '';
-      body = `<textarea class="form-input student-reflection" data-pid="${esc(p.id)}" data-tier="${esc(p.tier)}" data-skill="${esc(p.skill)}" data-trigger="${esc(p.trigger)}" placeholder="Write your reflection here — in your own words." ${readonly}>${esc(ans?ans.text:'')}</textarea>`;
+      body = `<textarea class="form-input student-reflection" data-pid="${esc(p.id)}" data-tier="${esc(p.tier)}" data-skill="${esc(p.skill)}" data-trigger="${esc(p.trigger)}" placeholder="Write your reflection here — in your own words.">${esc(ans?ans.text:'')}</textarea>
+        <button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="submitReflection('${esc(p.id)}')">Submit this reflection</button>
+        <div class="hint" style="margin-top:4px">This submits just this reflection — separately from the project itself below. Once submitted it locks; contact your instructor to revise it.</div>`;
     }
     return `<div class="prompt-card ${kc}">
       <div class="pc-meta">
@@ -443,6 +729,7 @@ function studentAssignmentHTML(){
     });
   }, 0);
   return `
+  <div class="breadcrumb"><a href="#" onclick="event.preventDefault();VIEW.mode='mycourses';renderStudentScreen();">My courses</a><span class="sep">/</span>${esc(hdr.title||'Assignment')}</div>
   <div class="privacy-banner">
     <b>Prototype notice:</b> shared storage here has no per-user access controls. Your answers are not privately siloed from other users of this app — please don't include anything sensitive.
   </div>
@@ -462,13 +749,13 @@ function studentAssignmentHTML(){
 
   <div class="card">
     <div class="card-title">Your reflection prompts</div>
-    <div class="hint" style="margin-bottom:12px">Prompts open on the schedule your instructor set — locked ones show when they'll open. Write directly in the box: paste, drag-and-drop, and right-click are disabled on these fields as a nudge to write in your own words (not real security — it just blocks the paste action).</div>
+    <div class="hint" style="margin-bottom:12px">Prompts open on the schedule your instructor set — locked ones show when they'll open. Each reflection has its own Submit button, separate from the project submission below, so you can turn one in as soon as it's ready without waiting on the rest. Write directly in the box: paste, drag-and-drop, and right-click are disabled on these fields as a nudge to write in your own words (not real security — it just blocks the paste action).</div>
     ${promptsHTML || '<div class="hint">No reflection prompts yet.</div>'}
   </div>
 
   <div class="card">
     <div class="card-title">Project submission</div>
-    <div class="hint" style="margin-bottom:10px">Link to where your work lives — Behance, Google Drive, GitHub, a personal site, YouTube, Figma, whatever fits the assignment. There's no file upload here, so make sure the link is shared or publicly viewable.</div>
+    <div class="hint" style="margin-bottom:10px">Link to where your work lives — Behance, Google Drive, GitHub, a personal site, YouTube, Figma, whatever fits the assignment. There's no file upload here, so make sure the link is shared or publicly viewable. This is separate from your reflection submissions above.</div>
     <div class="form-group"><label class="form-label">Link to your work <span class="req-star">*</span></label>
       <input class="form-input" id="student-link" placeholder="https://…" value="${esc(sub.project.link)}" ${sub.status==='submitted'?'readonly':''} oninput="onProjectField('link', this.value)"></div>
     <div class="form-group"><label class="form-label">Short description</label>
@@ -480,7 +767,9 @@ function studentAssignmentHTML(){
 }
 
 /* ══════════════════ Init ══════════════════ */
+restoreStudentSession();
 renderStudentScreen();
+if (STU.loggedIn) loadStudentEntries();
 
 </script>
 </body>

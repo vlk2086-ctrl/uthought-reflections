@@ -2583,21 +2583,28 @@ function showApp(mode){
 /* ══════════════════ STEP 8 — Roster & Publish (Builder extension) ══════════════════ */
 let STEP8 = { forId:null, sections:null, rosters:{}, addingSection:false, confirmReplace:{} };
 let _step8LoadPromise = null, _step8LoadForId = null;
+// Bumped on every LOCAL mutation of STEP8 (adding a section, generating a roster).
+// A pending background load captures the generation it started at; if that number has
+// moved by the time the load resolves, a local edit happened in the meantime and wins —
+// the (now-stale) fetched result is discarded instead of overwriting fresher local state.
+let STEP8_GEN = 0;
 function ensureStep8Sections(){
   if (!A.assignmentId) { STEP8.sections = []; STEP8.rosters = {}; STEP8.forId = null; return; }
   if (STEP8.forId === A.assignmentId && STEP8.sections !== null) return; // already loaded — never re-fetch out from under local edits
   if (_step8LoadPromise && _step8LoadForId === A.assignmentId) return _step8LoadPromise; // a load is already in flight for this assignment — don't start a second, overlapping one
   _step8LoadForId = A.assignmentId;
   STEP8.addingSection = false; STEP8.confirmReplace = {};
+  const gen = STEP8_GEN;
   _step8LoadPromise = (async () => {
     const sections = await storageGet('sections:'+A.assignmentId, []);
     const rosters = {};
     await Promise.all(sections.map(async s=>{ rosters[s.id] = await storageGet('roster:'+A.assignmentId+':'+s.id, []); }));
+    _step8LoadPromise = null;
+    if (gen !== STEP8_GEN) return; // a local edit (add section / generate roster) landed while this fetch was in flight — it wins, this stale read is discarded
     // Only mark this assignment "loaded" once the fetch actually lands — setting forId
     // any earlier is what let a second concurrent load fetch stale data and stomp on
     // sections/rosters that had already been added locally in the meantime.
     STEP8.sections = sections; STEP8.rosters = rosters; STEP8.forId = A.assignmentId;
-    _step8LoadPromise = null;
     if (A.step === 8) renderStep();
   })();
   return _step8LoadPromise;
@@ -2708,7 +2715,7 @@ async function confirmAddSection(){
   const sec = { id:'sec-'+Math.random().toString(36).slice(2,9), name, createdAt: new Date().toISOString() };
   const updated = sections.concat([sec]);
   const ok = await storageSet('sections:'+A.assignmentId, updated);
-  if (ok) { STEP8.sections = updated; STEP8.rosters[sec.id] = []; STEP8.addingSection = false; renderStep(); }
+  if (ok) { STEP8_GEN++; STEP8.sections = updated; STEP8.rosters[sec.id] = []; STEP8.forId = A.assignmentId; STEP8.addingSection = false; renderStep(); }
   else if (status) status.textContent = 'Could not add the section — try again.';
 }
 function generateRosterForSection(sectionId, countRaw, mode){
@@ -2733,7 +2740,7 @@ async function doGenerateRosterForSection(sectionId, countRaw, mode){
   const idx = await storageGet('codeIndex', {});
   added.forEach(c => { idx[c] = { assignmentId: A.assignmentId, sectionId }; });
   const okIdx = await storageSet('codeIndex', idx);
-  if (okRoster && okIdx) { STEP8.rosters[sectionId] = roster; renderStep(); }
+  if (okRoster && okIdx) { STEP8_GEN++; STEP8.rosters[sectionId] = roster; STEP8.forId = A.assignmentId; renderStep(); }
   else toast('Could not save the roster — try again.');
 }
 function sectionsListHTML(){
@@ -3112,14 +3119,27 @@ function gradingDetailHTML(){
   const asn = G.assignment;
   const answersHTML = (asn.prompts||[]).map(p=>{
     const a = (sub.answers||[]).find(x=>x.id===p.id);
+    const submitted = a && a.status === 'submitted';
+    const pillHTML = a
+      ? (submitted
+          ? `<span class="status-pill" style="background:var(--teal)">✓ Submitted</span>`
+          : `<span class="status-pill" style="background:var(--amber-text)">Draft</span>`)
+      : `<span class="status-pill" style="background:#8A8A80">Not started</span>`;
+    const matchedCi = matchingCriteriaIndices(asn, p);
+    const inlineHTML = matchedCi.length
+      ? matchedCi.map(ci=>inlineCriterionRowHTML(ci, asn)).join('')
+      : `<div class="hint" style="margin-top:8px">No rubric criterion tagged ${esc(TIER_LABEL[p.tier]||'')}${p.skill?' / '+esc(p.skill):''} — add one in the builder to assess this reflection directly here.</div>`;
     return `<div class="prompt-card" style="background:var(--bg2);border-color:var(--border2)">
       <div class="pc-meta">
         <span class="tier-chip" style="background:${TIER_HEX[p.tier]||'var(--gold)'};${p.tier==='technical'?'color:var(--pine)':''}">${TIER_LABEL[p.tier]||''}</span>
         ${p.skill?`<span class="hint">${esc(p.skill)}</span>`:''}
         <span class="pc-trigger">${esc(p.trigger)}</span>
+        ${pillHTML}
+        ${submitted && a.submittedAt ? `<span class="hint">Submitted ${esc(fmtDateTime(a.submittedAt))}</span>` : ''}
       </div>
       <div style="font-family:var(--font-display);font-size:14px;color:var(--char);margin-bottom:6px"><i>${esc(p.text)}</i></div>
       <div style="white-space:pre-wrap">${a && a.text ? esc(a.text) : '<span class="hint">No answer yet.</span>'}</div>
+      ${inlineHTML}
     </div>`;
   }).join('') || '<div class="hint">No reflection prompts on this assignment.</div>';
   return `
@@ -3142,7 +3162,8 @@ function gradingDetailHTML(){
   </div>
 
   <div class="card">
-    <div class="card-title">Rubric — grade this submission</div>
+    <div class="card-title">Rubric — full overview</div>
+    <div class="hint" style="margin-bottom:10px">Same grade as the per-skill boxes next to each reflection above — this is just the whole rubric in one place, for criteria that aren't tied to a specific reflection (e.g. the project itself) or for a final pass once everything's in.</div>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
       <button class="btn btn-blue btn-sm" id="btn-ai-grade" onclick="draftAIGrade()">✨ Draft AI-assisted feedback</button>
       <span class="hint" id="ai-grade-status"></span>
@@ -3153,6 +3174,38 @@ function gradingDetailHTML(){
       <textarea class="form-input" id="grade-overall" style="min-height:100px" oninput="G.draftGrade.overallFeedback=this.value">${esc(G.draftGrade.overallFeedback)}</textarea></div>
     <div class="grade-total-line">Total: <b>${gradeTotal()}</b> / ${maxPossible(asn.rubric)}</div>
     <button class="btn btn-primary" onclick="saveGrade()">💾 Save grade</button>
+  </div>`;
+}
+/* ── Reflection ⇄ rubric linkage. A rubric criterion and a reflection prompt
+   are considered the "same skill" when they share a tier and skill string —
+   the same matching key already used to build the student's skills dashboard.
+   This lets a criterion be assessed right next to the specific reflection
+   that's evidence for it, instead of only through one combined grid at the
+   bottom that requires the whole submission to review at once. ── */
+function matchingCriteriaIndices(asn, p){
+  const rubric = asn && asn.rubric;
+  if (!rubric || !Array.isArray(rubric.criteria)) return [];
+  const out = [];
+  rubric.criteria.forEach((c,ci)=>{
+    if (c.tier === p.tier && (c.skill||'').trim().toLowerCase() === (p.skill||'').trim().toLowerCase()) out.push(ci);
+  });
+  return out;
+}
+function inlineCriterionRowHTML(ci, asn){
+  const c = asn.rubric.criteria[ci];
+  const sc = asn.rubric.scale||[];
+  const sel = G.draftGrade.criteria[ci] || { levelIndex:null, comment:'' };
+  const cells = (c.levels||[]).map((d,li)=>{
+    const isSel = sel.levelIndex === li;
+    const bg = isSel ? (TIER_HEX[c.tier]||'var(--gold)') : 'var(--bg)';
+    const fg = isSel ? (c.tier==='technical' ? 'var(--pine)' : '#fff') : 'var(--text)';
+    return `<span onclick="selectGradeCell(${ci},${li})" title="${esc(d)}" style="cursor:pointer;display:inline-block;padding:4px 10px;border-radius:6px;background:${bg};color:${fg};font-size:11.5px;margin:2px 4px 2px 0;border:1px solid var(--border2)">${esc((sc[li]||{}).label||('Level '+(li+1)))}</span>`;
+  }).join('');
+  return `<div style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--border2)">
+    <div class="hint" style="margin-bottom:4px"><b>Assess this skill — ${esc(c.name)}</b></div>
+    <div>${cells}</div>
+    <input class="form-input" style="margin-top:6px;font-size:12px;padding:5px 8px" placeholder="Comment on this skill (optional)" value="${esc(sel.comment||'')}" oninput="G.draftGrade.criteria[${ci}].comment=this.value">
+    <button class="btn btn-ghost btn-sm" style="margin-top:6px" onclick="saveGrade()">💾 Save</button>
   </div>`;
 }
 function rubricGradingGridHTML(rubric){
