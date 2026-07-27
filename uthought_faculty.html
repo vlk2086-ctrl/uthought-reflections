@@ -3032,7 +3032,7 @@ function dashboardHTML(){
    Dashboard. No code or ID entry in between: click a course, click an
    assignment, click a section, click a student, grade.
    ══════════════════════════════════════════════════════════════════════ */
-let G = { assignmentId:'', sectionId:'', sectionName:'', assignment:null, roster:[], submissions:{}, openCode:null, draftGrade:null, aiSuggestion:null };
+let G = { assignmentId:'', sectionId:'', sectionName:'', assignment:null, roster:[], submissions:{}, openCode:null, draftGrade:null, aiSuggestion:null, criterionAI:{} };
 function blankSubmission(code){
   return { code, status:'not_started', answers:[], project:{ link:'', description:'' }, submittedAt:null, grade:null };
 }
@@ -3111,6 +3111,7 @@ function openSubmission(code){
     ? JSON.parse(JSON.stringify(sub.grade))
     : { criteria: ((G.assignment.rubric&&G.assignment.rubric.criteria)||[]).map(()=>({ levelIndex:null, comment:'' })), overallFeedback:'', total:0 };
   G.aiSuggestion = null;
+  G.criterionAI = {};
   renderGradingScreen();
 }
 function gradingDetailHTML(){
@@ -3127,7 +3128,7 @@ function gradingDetailHTML(){
       : `<span class="status-pill" style="background:#8A8A80">Not started</span>`;
     const matchedCi = matchingCriteriaIndices(asn, p);
     const inlineHTML = matchedCi.length
-      ? matchedCi.map(ci=>inlineCriterionRowHTML(ci, asn)).join('')
+      ? matchedCi.map(ci=>inlineCriterionRowHTML(ci, asn, p.id)).join('')
       : `<div class="hint" style="margin-top:8px">No rubric criterion tagged ${esc(TIER_LABEL[p.tier]||'')}${p.skill?' / '+esc(p.skill):''} — add one in the builder to assess this reflection directly here.</div>`;
     return `<div class="prompt-card" style="background:var(--bg2);border-color:var(--border2)">
       <div class="pc-meta">
@@ -3191,29 +3192,82 @@ function matchingCriteriaIndices(asn, p){
   });
   return out;
 }
-function inlineCriterionRowHTML(ci, asn){
+function inlineCriterionRowHTML(ci, asn, promptId){
   const c = asn.rubric.criteria[ci];
   const sc = asn.rubric.scale||[];
   const sel = G.draftGrade.criteria[ci] || { levelIndex:null, comment:'' };
-  const cells = (c.levels||[]).map((d,li)=>{
+  const selectedPts = sel.levelIndex!=null ? (sc[sel.levelIndex]||{}).points : null;
+  const selectedLabel = sel.levelIndex!=null ? (sc[sel.levelIndex]||{}).label : null;
+  const headerCells = sc.map(lv=>`<th>${esc(lv.label)} <span style="font-weight:400;color:var(--text2)">(${lv.points})</span></th>`).join('');
+  const bodyCells = (c.levels||[]).map((d,li)=>{
     const isSel = sel.levelIndex === li;
-    const bg = isSel ? (TIER_HEX[c.tier]||'var(--gold)') : 'var(--bg)';
+    const bg = isSel ? (TIER_HEX[c.tier]||'var(--gold)') : 'transparent';
     const fg = isSel ? (c.tier==='technical' ? 'var(--pine)' : '#fff') : 'var(--text)';
-    return `<span onclick="selectGradeCell(${ci},${li})" title="${esc(d)}" style="cursor:pointer;display:inline-block;padding:4px 10px;border-radius:6px;background:${bg};color:${fg};font-size:11.5px;margin:2px 4px 2px 0;border:1px solid var(--border2)">${esc((sc[li]||{}).label||('Level '+(li+1)))}</span>`;
+    return `<td data-gradable style="background:${bg};color:${fg};cursor:pointer" onclick="selectGradeCell(${ci},${li})" title="${esc(d)}">${esc(d)}</td>`;
   }).join('');
+  const ai = G.criterionAI[ci];
   return `<div style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--border2)">
-    <div class="hint" style="margin-bottom:4px"><b>Assess this skill — ${esc(c.name)}</b></div>
-    <div>${cells}</div>
-    <input class="form-input" style="margin-top:6px;font-size:12px;padding:5px 8px" placeholder="Comment on this skill (optional)" value="${esc(sel.comment||'')}" oninput="G.draftGrade.criteria[${ci}].comment=this.value">
-    <button class="btn btn-ghost btn-sm" style="margin-top:6px" onclick="saveGrade()">💾 Save</button>
+    <div class="hint" style="margin-bottom:6px">
+      <b>Assess this skill</b>${selectedLabel ? ` — <span style="color:${TIER_HEX[c.tier]||'var(--gold)'};font-weight:700">${esc(selectedLabel)} (${selectedPts} pts)</span>` : ' — not yet graded'}
+    </div>
+    <div style="overflow:auto"><table class="rubric-table" style="font-size:11.5px">
+      <thead><tr><th style="min-width:150px">Criterion</th>${headerCells}</tr></thead>
+      <tbody><tr><td style="min-width:150px">${c.tier?tierChipSmall(c.tier):''}<b>${esc(c.name)}</b></td>${bodyCells}</tr></tbody>
+    </table></div>
+    <div style="display:flex;gap:8px;align-items:center;margin:10px 0 6px;flex-wrap:wrap">
+      <button class="btn btn-blue btn-sm" id="ai-crit-btn-${ci}" onclick="draftAICriterionFeedback(${ci},'${esc(promptId)}')">✨ Get AI help (optional)</button>
+      <span class="hint" id="ai-crit-status-${ci}"></span>
+    </div>
+    ${ai ? `<div class="ai-suggestion-box" style="margin-bottom:8px">
+      <div class="coach-h" style="color:var(--gold)">AI-drafted suggestion — review before using</div>
+      <div class="hint" style="margin:4px 0 8px">${esc(ai.feedback||'')}${typeof ai.levelIndex==='number' && sc[ai.levelIndex] ? ' — suggested level: '+esc(sc[ai.levelIndex].label) : ''}</div>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-teal btn-sm" onclick="applyCriterionAI(${ci})">Apply suggestion</button>
+        <button class="btn btn-ghost btn-sm" onclick="G.criterionAI[${ci}]=null;renderGradingScreen()">Discard</button>
+      </div>
+    </div>` : ''}
+    <label class="form-label" style="margin-top:4px">Feedback on this skill</label>
+    <textarea class="form-input" style="min-height:90px" placeholder="Optional — specific feedback on just this reflection/skill" oninput="G.draftGrade.criteria[${ci}].comment=this.value">${esc(sel.comment||'')}</textarea>
+    <button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="saveGrade()">💾 Save</button>
   </div>`;
+}
+async function draftAICriterionFeedback(ci, promptId){
+  const btn = document.getElementById('ai-crit-btn-'+ci);
+  const status = document.getElementById('ai-crit-status-'+ci);
+  if (btn) btn.disabled = true;
+  if (status) status.innerHTML = '<span class="spin"></span> Drafting…';
+  try {
+    const asn = G.assignment;
+    const c = asn.rubric.criteria[ci];
+    const sc = asn.rubric.scale||[];
+    const sub = G.submissions[G.openCode] || blankSubmission(G.openCode);
+    const p = (asn.prompts||[]).find(x=>x.id===promptId);
+    const a = (sub.answers||[]).find(x=>x.id===promptId);
+    const levelsText = (c.levels||[]).map((d,li)=>`(${li}) ${(sc[li]||{}).label}: ${d}`).join(' | ');
+    const prompt = `You are assisting a faculty member in grading ONE specific skill on ONE student reflection. You are drafting a SUGGESTION only — the faculty member reviews, edits, or discards it before anything counts.\n\nReflection prompt: ${p?p.text:''}\nStudent's answer: ${a&&a.text?a.text:'(no answer)'}\n\nCriterion: ${c.name} [${c.tier}${c.skill?' · '+c.skill:''}]\nLevels (index. label: description): ${levelsText}\n\nSuggest the best-fit level index (0-based) and write 2-3 sentences of specific, warm feedback on this one skill. Return ONLY JSON, no markdown: {"levelIndex":0,"feedback":"..."}`;
+    const txt = await callClaudeAPI([{role:'user',content:prompt}], 500);
+    const obj = parseJSON(txt);
+    if (!obj || typeof obj.levelIndex !== 'number') throw new Error('parse');
+    G.criterionAI[ci] = obj;
+    renderGradingScreen();
+  } catch(e){ if (status) status.textContent = 'Could not draft a suggestion — try again.'; }
+  finally { const b = document.getElementById('ai-crit-btn-'+ci); if (b) b.disabled = false; }
+}
+function applyCriterionAI(ci){
+  const sug = G.criterionAI[ci]; if (!sug) return;
+  if (!G.draftGrade.criteria[ci]) G.draftGrade.criteria[ci] = { levelIndex:null, comment:'' };
+  if (typeof sug.levelIndex === 'number') G.draftGrade.criteria[ci].levelIndex = sug.levelIndex;
+  if (sug.feedback) G.draftGrade.criteria[ci].comment = sug.feedback;
+  G.criterionAI[ci] = null;
+  renderGradingScreen();
+  toast('AI suggestion applied — review and edit before saving.');
 }
 function rubricGradingGridHTML(rubric){
   if (!rubric || !Array.isArray(rubric.criteria) || !rubric.criteria.length) return '<div class="hint">No rubric on this assignment.</div>';
   const sc = rubric.scale||[];
   let h = '<div style="overflow:auto"><table class="rubric-table"><thead><tr><th style="min-width:150px">Criterion</th>';
   sc.forEach(lv=>{ h += `<th>${esc(lv.label)} <span style="font-weight:400;color:var(--text2)">(${lv.points})</span></th>`; });
-  h += '<th style="min-width:150px">Comment</th></tr></thead><tbody>';
+  h += '<th style="min-width:150px">Comment</th><th>Points</th></tr></thead><tbody>';
   rubric.criteria.forEach((c,ci)=>{
     const sel = G.draftGrade.criteria[ci] || { levelIndex:null, comment:'' };
     h += `<tr><td style="min-width:150px">${c.tier?tierChipSmall(c.tier):''}<b>${esc(c.name)}</b></td>`;
@@ -3223,7 +3277,9 @@ function rubricGradingGridHTML(rubric){
       const fg = isSel ? (c.tier==='technical' ? 'var(--pine)' : '#fff') : 'var(--text)';
       h += `<td data-gradable style="background:${bg};color:${fg}" onclick="selectGradeCell(${ci},${li})" title="${esc(d)}">${esc(d)}</td>`;
     });
-    h += `<td><input class="form-input" style="padding:5px 8px;font-size:12px" value="${esc(sel.comment||'')}" oninput="G.draftGrade.criteria[${ci}].comment=this.value"></td></tr>`;
+    h += `<td><input class="form-input" style="padding:5px 8px;font-size:12px" value="${esc(sel.comment||'')}" oninput="G.draftGrade.criteria[${ci}].comment=this.value"></td>`;
+    const pts = sel.levelIndex!=null ? (sc[sel.levelIndex]||{}).points : null;
+    h += `<td style="text-align:center;font-weight:700">${pts!=null?pts:'—'}</td></tr>`;
   });
   return h + '</tbody></table></div>';
 }
