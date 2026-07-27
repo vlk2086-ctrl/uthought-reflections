@@ -98,6 +98,13 @@ body { font-family: var(--font-body); font-size: 14px; background: var(--bg); co
 .breadcrumb .sep { margin:0 6px; opacity:.5; }
 .chip { display:inline-block; padding:5px 12px; border-radius:999px; border:1px solid var(--border2); font-size:12.5px; margin:0 6px 6px 0; cursor:pointer; }
 .chip:hover { background:var(--bg2); }
+.skill-row { padding:6px 0; }
+.skill-meta { display:flex; align-items:baseline; justify-content:space-between; margin-bottom:4px; font-size:13px; }
+.skill-name { color:var(--text); font-weight:600; }
+.skill-pct { font-size:12px; color:var(--text2); }
+.skill-bar { height:6px; border-radius:3px; background:var(--bg3); overflow:hidden; }
+.skill-fill { height:100%; border-radius:3px; transition:width .6s ease; opacity:.88; }
+.skill-source { font-size:11px; color:var(--text2); margin-top:3px; }
 
 .wrap { max-width: 820px; margin: 0 auto; padding: 28px; padding-bottom: 60px; }
 .btn { display:inline-flex; align-items:center; gap:6px; padding:8px 15px; border-radius:var(--radius-sm); font-size:13px; font-weight:500; cursor:pointer; border:none; font-family:var(--font-body); transition:opacity .15s, background .15s; }
@@ -357,14 +364,14 @@ async function studentDoLogin(){
       await storageSet(key, { email, passHash: hash, createdAt: new Date().toISOString() });
       STU = { email, loggedIn:true };
       try { localStorage.setItem(STU_SESSION_KEY, email); } catch(_){}
-      STU_ENTRIES = null; VIEW.mode = 'mycourses';
+      STU_ENTRIES = null; VIEW.mode = 'dashboard';
       toast('Account created — you\'re logged in.');
       renderStudentScreen();
       loadStudentEntries();
     } else if (acct.passHash === hash) {
       STU = { email, loggedIn:true };
       try { localStorage.setItem(STU_SESSION_KEY, email); } catch(_){}
-      STU_ENTRIES = null; VIEW.mode = 'mycourses';
+      STU_ENTRIES = null; VIEW.mode = 'dashboard';
       renderStudentScreen();
       loadStudentEntries();
     } else {
@@ -385,6 +392,7 @@ function updateStudentNav(){
   const nav = document.getElementById('topnav'); if (!nav) return;
   if (!STU.loggedIn) { nav.innerHTML = ''; return; }
   nav.innerHTML = `
+    <a href="#" data-mode="dashboard" onclick="event.preventDefault();VIEW.mode='dashboard';renderStudentScreen();">Skills dashboard</a>
     <a href="#" data-mode="mycourses" onclick="event.preventDefault();VIEW.mode='mycourses';renderStudentScreen();">My courses</a>
     <a href="#" onclick="event.preventDefault();studentLogout()">Log out (${esc(STU.email)})</a>`;
   const active = document.querySelector('#topnav a[data-mode="'+VIEW.mode+'"]'); if (active) active.classList.add('active');
@@ -406,7 +414,8 @@ function renderStudentScreen(){
   const el = document.getElementById('student-wrap');
   if (!STU.loggedIn) { el.innerHTML = studentLoginHTML(); return; }
   if (VIEW.mode === 'assignment' && S.assignment) { el.innerHTML = studentAssignmentHTML(); return; }
-  el.innerHTML = studentMyCoursesHTML();
+  if (VIEW.mode === 'mycourses') { el.innerHTML = studentMyCoursesHTML(); return; }
+  el.innerHTML = dashboardScreenHTML(); // default landing view once logged in
 }
 function studentLoginHTML(){
   return `
@@ -436,24 +445,37 @@ async function loadStudentEntries(){
    entered a code for, so it's automatically per-student and per-major —
    there's no separate declared-major filter because it's just "your work."
    ══════════════════════════════════════════════════════════════════════ */
-let SKILLS = null; // null = not loaded yet this session; { character:{}, durable:{}, technical:{} } once loaded, each mapping skill name -> array of evidence items
+let SKILLS = null; // null = not loaded yet this session; { character:{}, durable:{}, technical:{} } once loaded, each mapping skill name -> array of evidence items (can be an empty array — that just means "tagged in a course, but no evidence yet")
 let SKILLS_UI = { open:null };
 async function loadSkillsEvidence(){
   const entries = STU_ENTRIES || [];
   const byTier = { character:{}, durable:{}, technical:{} };
+  function ensureSkill(tier, skill){
+    const t = byTier[tier]; if (!t) return null;
+    if (!t[skill]) t[skill] = [];
+    return t[skill];
+  }
   await Promise.all(entries.map(async e => {
     const [sub, asn] = await Promise.all([
       storageGet('submission:'+e.assignmentId+':'+e.sectionId+':'+e.code, null),
       storageGet('assignment:'+e.assignmentId, null)
     ]);
+    if (!asn) return;
+    // Seed every skill this course/assignment targets — from its reflection
+    // prompts AND its rubric — even before there's any evidence for it. That's
+    // what makes a skill show up at 0%, "ready to build," the moment it's
+    // listed on a single course/assignment, not only once something is graded.
+    (asn.prompts||[]).forEach(p => { if (p.tier && p.skill) ensureSkill(p.tier, p.skill); });
+    if (asn.rubric && Array.isArray(asn.rubric.criteria)) {
+      asn.rubric.criteria.forEach(c => { if (c.tier && c.skill) ensureSkill(c.tier, c.skill); });
+    }
     if (!sub) return;
     // Self-reported evidence: every reflection prompt the student has submitted,
     // tagged with the tier/skill the instructor wrote into the prompt itself.
     (sub.answers||[]).forEach(a => {
       if (a.status !== 'submitted' || !a.tier || !a.skill) return;
-      const tier = byTier[a.tier]; if (!tier) return;
-      if (!tier[a.skill]) tier[a.skill] = [];
-      tier[a.skill].push({
+      const list = ensureSkill(a.tier, a.skill); if (!list) return;
+      list.push({
         source: 'reflection', courseName: e.courseName||'', assignmentTitle: e.assignmentTitle||'', code: e.code,
         trigger: a.trigger||'', submittedAt: a.submittedAt||null
       });
@@ -461,73 +483,150 @@ async function loadSkillsEvidence(){
     // Instructor-assessed evidence: once faculty grades a submission against the
     // rubric, each graded criterion (which also carries a tier + skill) becomes a
     // stronger, validated form of evidence — distinct from the student's own
-    // self-reported reflections above, per the same evidence you already see in
-    // the rubric during grading.
-    if (sub.grade && Array.isArray(sub.grade.criteria) && asn && asn.rubric && Array.isArray(asn.rubric.criteria)) {
+    // self-reported reflections above.
+    if (sub.grade && Array.isArray(sub.grade.criteria) && asn.rubric && Array.isArray(asn.rubric.criteria)) {
       const scale = asn.rubric.scale || [];
+      const maxPts = Math.max(0, ...scale.map(s=>s.points||0));
       asn.rubric.criteria.forEach((c, ci) => {
         const g = sub.grade.criteria[ci];
         if (!g || g.levelIndex == null || !c.tier || !c.skill) return;
-        const tier = byTier[c.tier]; if (!tier) return;
-        if (!tier[c.skill]) tier[c.skill] = [];
+        const list = ensureSkill(c.tier, c.skill); if (!list) return;
         const levelLabel = (scale[g.levelIndex]||{}).label || '';
-        tier[c.skill].push({
+        const points = (scale[g.levelIndex]||{}).points || 0;
+        list.push({
           source: 'assessment', courseName: e.courseName||'', assignmentTitle: e.assignmentTitle||'', code: e.code,
-          levelLabel, comment: g.comment||'', submittedAt: sub.grade.gradedAt||null
+          levelLabel, points, maxPoints: maxPts, comment: g.comment||'', submittedAt: sub.grade.gradedAt||null
         });
       });
     }
   }));
   SKILLS = byTier;
-  if (VIEW.mode === 'mycourses') renderStudentScreen();
+  if (VIEW.mode === 'mycourses' || VIEW.mode === 'dashboard') renderStudentScreen();
 }
 function toggleSkillDetail(key){ SKILLS_UI.open = (SKILLS_UI.open===key ? null : key); renderStudentScreen(); }
-function skillsDashboardCardHTML(){
-  if (SKILLS === null) {
-    loadSkillsEvidence();
-    return `<div class="card"><div class="card-title">Skills dashboard</div>${loadingHTML('your skills evidence')}</div>`;
+// A skill's fill % favors validated (instructor-assessed) evidence when it exists —
+// averaging how close to the top of the scale each assessed criterion landed.
+// Self-reported-only evidence gets a smaller, capped bump, since it hasn't been
+// validated by anyone yet. No evidence at all — including a skill that's simply
+// listed on a course but hasn't been touched — sits at 0%, "ready to build."
+function skillLevelPct(items){
+  const assessed = items.filter(i=>i.source==='assessment' && i.maxPoints);
+  if (assessed.length) {
+    const avgFrac = assessed.reduce((s,i)=>s+(i.points/i.maxPoints), 0) / assessed.length;
+    return Math.round(avgFrac*100);
   }
+  const reflectionCount = items.filter(i=>i.source==='reflection').length;
+  if (reflectionCount) return Math.min(20 + (reflectionCount-1)*15, 65);
+  return 0;
+}
+function skillSourceCaption(items){
+  if (!items.length) return 'Ready to build — no evidence yet.';
+  const assessedCount = items.filter(i=>i.source==='assessment').length;
+  const reflectionCount = items.filter(i=>i.source==='reflection').length;
+  const parts = [];
+  if (reflectionCount) parts.push(reflectionCount+' reflection'+(reflectionCount===1?'':'s')+' (self-reported)');
+  if (assessedCount) parts.push(assessedCount+' instructor-assessed');
+  return parts.join(' · ');
+}
+function skillEvidenceDetailHTML(items){
+  if (!items.length) return '<div class="hint">No evidence yet — this skill is tagged on at least one of your courses, but nothing has been submitted or graded for it.</div>';
+  return items.map(it=>{
+    const sourceTag = it.source === 'assessment'
+      ? `<span class="status-pill" style="background:var(--teal);margin-left:6px">✓ Instructor-assessed${it.levelLabel?' — '+esc(it.levelLabel):''}</span>`
+      : `<span class="status-pill" style="background:#8A8A80;margin-left:6px">Self-reported</span>`;
+    const dateStr = it.submittedAt ? esc(fmtDate(String(it.submittedAt).slice(0,10))) : '';
+    const comment = it.source==='assessment' && it.comment ? `<div class="hint" style="margin:2px 0 0 0"><i>${esc(it.comment)}</i></div>` : '';
+    return `<div style="margin-bottom:6px">${esc(it.courseName)}${it.assignmentTitle?' · '+esc(it.assignmentTitle):''}${dateStr?' · '+dateStr:''}${sourceTag}
+      <a href="#" onclick="event.preventDefault();openStudentEntry('${esc(it.code)}')" style="color:var(--sage);margin-left:6px">Open →</a>${comment}</div>`;
+  }).join('');
+}
+/* ── The skills framework pyramid — a static, illustrative graphic (not
+   data-bound), reused from the original uThought prototype's home page,
+   recolored to this app's tier palette (character/durable/technical). ── */
+function pyramidSVG(){
+  return `<svg width="100%" viewBox="0 0 720 380" style="display:block;max-width:640px;margin:0 auto" role="img" aria-label="Skills pyramid: character at base, durable skills in middle, technical and major skills at the apex">
+    <defs>
+      <linearGradient id="grad-char" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="${TIER_HEX.character}" stop-opacity=".92"/>
+        <stop offset="100%" stop-color="${TIER_HEX.character}" stop-opacity=".74"/>
+      </linearGradient>
+      <linearGradient id="grad-dur" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="${TIER_HEX.durable}" stop-opacity=".92"/>
+        <stop offset="100%" stop-color="${TIER_HEX.durable}" stop-opacity=".74"/>
+      </linearGradient>
+      <linearGradient id="grad-tech" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="${TIER_HEX.technical}" stop-opacity="1"/>
+        <stop offset="100%" stop-color="${TIER_HEX.technical}" stop-opacity=".85"/>
+      </linearGradient>
+    </defs>
+    <polygon points="220,243 500,243 570,340 150,340" fill="url(#grad-char)" stroke="#fff" stroke-width="2"/>
+    <polygon points="290,147 430,147 500,243 220,243" fill="url(#grad-dur)" stroke="#fff" stroke-width="2"/>
+    <polygon points="360,50 430,147 290,147" fill="url(#grad-tech)" stroke="#fff" stroke-width="2"/>
+    <text x="360" y="184" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif" font-size="12.5" font-weight="700" fill="#fff">Durable Power Skills</text>
+    <text x="360" y="203" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif" font-size="9" fill="#fff" opacity=".92">Critical thinking · Communication</text>
+    <text x="360" y="218" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif" font-size="9" fill="#fff" opacity=".92">Collaboration · Creativity · Agility</text>
+    <text x="360" y="283" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif" font-size="13" font-weight="700" fill="#fff">Character Skills</text>
+    <text x="360" y="303" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif" font-size="9" fill="#fff" opacity=".92">Fortitude · Curiosity · Integrity · Judgment · Humility · Purpose</text>
+    <line x1="411" y1="120" x2="492" y2="120" stroke="${TIER_HEX.technical}" stroke-width="1" stroke-dasharray="3 2"/>
+    <circle cx="411" cy="120" r="2.5" fill="${TIER_HEX.technical}"/>
+    <text x="498" y="117" text-anchor="start" font-family="-apple-system,system-ui,sans-serif" font-size="12.5" font-weight="700" fill="${TIER_HEX.technical}">Technical + Major Skills</text>
+    <text x="498" y="132" text-anchor="start" font-family="-apple-system,system-ui,sans-serif" font-size="9.5" fill="#6B6860">Specialized · Field-specific · Applied</text>
+    <line x1="327" y1="96" x2="135" y2="96" stroke="${TIER_HEX.technical}" stroke-width="1" stroke-dasharray="3 2"/>
+    <circle cx="327" cy="96" r="2.5" fill="${TIER_HEX.technical}"/>
+    <text x="128" y="93" text-anchor="end" font-family="-apple-system,system-ui,sans-serif" font-size="11.5" fill="${TIER_HEX.technical}" font-weight="700">Specialized</text>
+    <text x="128" y="108" text-anchor="end" font-family="-apple-system,system-ui,sans-serif" font-size="10" fill="#6B6860">Your craft</text>
+    <line x1="255" y1="195" x2="135" y2="195" stroke="${TIER_HEX.durable}" stroke-width="1" stroke-dasharray="3 2"/>
+    <circle cx="255" cy="195" r="2.5" fill="${TIER_HEX.durable}"/>
+    <text x="128" y="192" text-anchor="end" font-family="-apple-system,system-ui,sans-serif" font-size="11.5" fill="${TIER_HEX.durable}" font-weight="700">Transferable</text>
+    <text x="128" y="207" text-anchor="end" font-family="-apple-system,system-ui,sans-serif" font-size="10" fill="#6B6860">What you can do</text>
+    <line x1="179" y1="300" x2="135" y2="300" stroke="${TIER_HEX.character}" stroke-width="1" stroke-dasharray="3 2"/>
+    <circle cx="179" cy="300" r="2.5" fill="${TIER_HEX.character}"/>
+    <text x="128" y="297" text-anchor="end" font-family="-apple-system,system-ui,sans-serif" font-size="11.5" fill="${TIER_HEX.character}" font-weight="700">The foundation</text>
+    <text x="128" y="312" text-anchor="end" font-family="-apple-system,system-ui,sans-serif" font-size="10" fill="#6B6860">Who you are</text>
+    <text x="360" y="366" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif" font-size="11" fill="#9a9a94">All three tiers are built continuously — none is ever finished.</text>
+  </svg>`;
+}
+function dashboardScreenHTML(){
+  if (STU_ENTRIES === null) { loadStudentEntries(); return loadingHTML('your dashboard'); }
+  if (SKILLS === null) { loadSkillsEvidence(); return `<div class="section-head">Skills dashboard</div>${loadingHTML('your skills evidence')}`; }
   const tiers = ['character','durable','technical'];
-  const totalCount = tiers.reduce((sum,t)=> sum + Object.values(SKILLS[t]).reduce((s,arr)=>s+arr.length,0), 0);
-  const barsHTML = tiers.map(t=>{
+  const tierCardsHTML = tiers.map(t=>{
     const skillMap = SKILLS[t];
-    const skillNames = Object.keys(skillMap).sort();
-    const tierCount = skillNames.reduce((s,n)=>s+skillMap[n].length,0);
-    const pct = totalCount ? Math.round(100*tierCount/totalCount) : 0;
-    const chips = skillNames.map(name => {
+    const names = Object.keys(skillMap).sort();
+    if (!names.length) {
+      return `<div class="card"><div class="card-title" style="color:${TIER_HEX[t]}">${TIER_LABEL[t]}</div><div class="hint">None of your courses have tagged a ${TIER_LABEL[t].toLowerCase()} skill yet.</div></div>`;
+    }
+    const rows = names.map(name=>{
       const items = skillMap[name];
+      const pct = skillLevelPct(items);
       const openKey = t+'::'+name;
       const isOpen = SKILLS_UI.open === openKey;
-      const assessedCount = items.filter(it=>it.source==='assessment').length;
-      const detail = items.map(it=>{
-        const sourceTag = it.source === 'assessment'
-          ? `<span class="status-pill" style="background:var(--teal);margin-left:6px">✓ Instructor-assessed${it.levelLabel?' — '+esc(it.levelLabel):''}</span>`
-          : `<span class="status-pill" style="background:#8A8A80;margin-left:6px">Self-reported</span>`;
-        const dateStr = it.submittedAt ? esc(fmtDate(String(it.submittedAt).slice(0,10))) : '';
-        const comment = it.source==='assessment' && it.comment ? `<div class="hint" style="margin:2px 0 0 0"><i>${esc(it.comment)}</i></div>` : '';
-        return `<div style="margin-bottom:6px">${esc(it.courseName)}${it.assignmentTitle?' · '+esc(it.assignmentTitle):''}${dateStr?' · '+dateStr:''}${sourceTag}
-          <a href="#" onclick="event.preventDefault();openStudentEntry('${esc(it.code)}')" style="color:var(--sage);margin-left:6px">Open →</a>${comment}</div>`;
-      }).join('');
-      return `<div style="margin-bottom:6px">
-        <span class="chip" style="border-color:${TIER_HEX[t]};font-size:12px;padding:4px 10px" onclick="toggleSkillDetail('${esc(openKey)}')">${esc(name)} (${items.length}${assessedCount?', '+assessedCount+' assessed':''})</span>
-        ${isOpen ? `<div style="margin:6px 0 2px 4px">${detail}</div>` : ''}
+      return `<div class="skill-row" style="cursor:pointer" onclick="toggleSkillDetail('${esc(openKey)}')">
+        <div class="skill-meta"><span class="skill-name">${esc(name)}</span><span class="skill-pct">${pct}%</span></div>
+        <div class="skill-bar"><div class="skill-fill" style="width:${pct}%;background:${TIER_HEX[t]}"></div></div>
+        <div class="skill-source">${esc(skillSourceCaption(items))}</div>
+        ${isOpen ? `<div style="margin-top:8px">${skillEvidenceDetailHTML(items)}</div>` : ''}
       </div>`;
-    }).join('') || '<div class="hint">No evidence yet.</div>';
-    return `<div style="margin-bottom:16px">
-      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px">
-        <b style="color:${TIER_HEX[t]};${t==='technical'?'':''}">${TIER_LABEL[t]}</b>
-        <span class="hint">${tierCount} reflection${tierCount===1?'':'s'}</span>
-      </div>
-      <div style="background:var(--bg2);border-radius:999px;height:8px;overflow:hidden;margin-bottom:8px">
-        <div style="width:${pct}%;height:100%;background:${TIER_HEX[t]}"></div>
-      </div>
-      ${chips}
+    }).join('');
+    return `<div class="card">
+      <div class="card-title" style="color:${TIER_HEX[t]}">${TIER_LABEL[t]}</div>
+      ${rows}
     </div>`;
   }).join('');
-  return `<div class="card">
-    <div class="card-title">Skills dashboard</div>
-    <div class="hint" style="margin-bottom:14px">Built from two sources: your own submitted reflections (self-reported, shown gray), and — once your instructor grades your work against the rubric — instructor-assessed evidence (validated, shown teal) for whichever skills that rubric covered. Click a skill to see where each piece came from.</div>
-    ${totalCount ? barsHTML : '<div class="hint">Submit a reflection, or wait for your instructor to grade your work, to start building this out.</div>'}
+  return `
+  <div class="section-head">Skills dashboard</div>
+  <div class="hint" style="margin-bottom:18px">Built from every course and assignment you've entered — a skill shows up here as soon as a single course targets it, even before you have any evidence for it yet. Reflections you submit (self-reported) and, once your instructor grades your work, their assessment (validated) both add evidence. Click any skill to see where its evidence came from.</div>
+
+  <div class="card" style="margin-bottom:20px;padding:24px 20px">
+    <div class="card-title">The skills framework</div>
+    ${pyramidSVG()}
+  </div>
+
+  ${tierCardsHTML}
+
+  <div class="card">
+    <div class="card-title">Career goals</div>
+    <div class="hint">Coming soon — set one or more career goals here and see how the skills you're building connect to the roles you're aiming for.</div>
   </div>`;
 }
 async function upsertStudentIndex(entry){
@@ -569,11 +668,10 @@ function studentMyCoursesHTML(){
 
   ${groupsHTML || '<div class="card"><div class="hint">No assignments yet — enter a code above to get started.</div></div>'}
 
-  ${skillsDashboardCardHTML()}
-
   <div class="card">
-    <div class="card-title">Career goals</div>
-    <div class="hint">Coming soon — set one or more career goals here and see how the skills you're building connect to the roles you're aiming for.</div>
+    <div class="card-title">Skills dashboard</div>
+    <div class="hint" style="margin-bottom:10px">See your skills progress across every course, built from your reflections and your instructors' assessments.</div>
+    <button class="btn btn-ghost btn-sm" onclick="VIEW.mode='dashboard';renderStudentScreen();">View your skills dashboard →</button>
   </div>`;
 }
 function studentCodeFormHTML(){
